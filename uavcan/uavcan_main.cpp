@@ -107,6 +107,17 @@ int uavcan_main(int argc, char *argv[])
 	node->setNodeID(self_node_id);
 	node->setName("org.uavcan.tutorials");
 
+	while (true)
+	{
+		const int res = node->start();
+		if (res < 0)
+		{
+			printf("Node start failed: %d, will retry\n", res);
+			sleep(1);
+		}
+		else { break; }
+	}
+
 	printf("Hello Sky!\n");
 	return OK;
 }
