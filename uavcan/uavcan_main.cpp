@@ -52,6 +52,8 @@
 #include <drivers/drv_pwm_output.h>
 
 #include "uavcan_main.hpp"
+#include <uavcan/protocol/debug/KeyValue.hpp>
+#include <uavcan/helpers/ostream.hpp>
 
 /**
  * @file uavcan_main.cpp
@@ -69,6 +71,87 @@ static constexpr unsigned MemPoolSize        = 10752; ///< Refer to the libuavca
 static constexpr unsigned RxQueueLenPerIface = 64;
 typedef uavcan::Node<MemPoolSize> Node;
 typedef uavcan_stm32::CanInitHelper<RxQueueLenPerIface> CanInitHelper;
+static CanInitHelper can;
+
+class MsgController
+{
+public:
+	MsgController(uavcan::INode& node);
+	~MsgController();
+
+	int init();
+	void msg_broadcast(uavcan::protocol::debug::KeyValue msg);
+
+private:
+	/**
+	 * ESC status message reception will be reported via this callback.
+	 */
+	void msg_sub_cb(const uavcan::ReceivedDataStructure<uavcan::protocol::debug::KeyValue> &msg);
+
+	typedef uavcan::MethodBinder<MsgController*,
+		void (MsgController::*)(const uavcan::ReceivedDataStructure<uavcan::protocol::debug::KeyValue>&)>
+		MsgCbBinder;
+
+/*	typedef uavcan::MethodBinder<UavcanEscController*, void (UavcanEscController::*)(const uavcan::TimerEvent&)>
+		TimerCbBinder;*/
+
+	/*
+	 * libuavcan related things
+	 */
+	uavcan::MonotonicTime							_prev_cmd_pub;   ///< rate limiting
+	uavcan::INode								&_node;
+	uavcan::Subscriber<uavcan::protocol::debug::KeyValue, MsgCbBinder>	_uavcan_sub_msg;
+	uavcan::Publisher<uavcan::protocol::debug::KeyValue> _uavcan_pub_msg;
+	//uavcan::TimerEventForwarder<TimerCbBinder>				_orb_timer;
+
+};
+
+MsgController::MsgController(uavcan::INode &node) :
+	_node(node),
+	_uavcan_sub_msg(node),
+	_uavcan_pub_msg(node)
+{
+}
+
+int MsgController::init()
+{
+    int res = _uavcan_pub_msg.init();
+    if (res < 0)
+    {
+		printf("publisher failed\n");
+        exit(1);                   // TODO proper error handling
+    }
+	_uavcan_pub_msg.setTxTimeout(uavcan::MonotonicDuration::fromMSec(1000));
+
+	// ESC status subscription
+	res = _uavcan_sub_msg.start(MsgCbBinder(this, &MsgController::msg_sub_cb));
+	if (res < 0)
+	{
+		warnx("subscriber failed %i\n", res);
+		exit(1);
+	}
+
+	// ESC status will be relayed from UAVCAN bus into ORB at this rate
+	//_orb_timer.setCallback(TimerCbBinder(this, &UavcanEscController::orb_pub_timer_cb));
+	//_orb_timer.startPeriodic(uavcan::MonotonicDuration::fromMSec(1000 / ESC_STATUS_UPDATE_RATE_HZ));
+
+	return res;
+}
+
+void MsgController::msg_broadcast(uavcan::protocol::debug::KeyValue msg)
+{
+	int res = _uavcan_pub_msg.broadcast(msg);
+	if (res < 0)
+	{
+		printf("KV publication failure: %d\n", res);
+	}
+}
+
+void MsgController::msg_sub_cb(const uavcan::ReceivedDataStructure<uavcan::protocol::debug::KeyValue> &msg)
+{
+	uavcan::OStream::instance() << msg << uavcan::OStream::endl;
+}
+
 
 extern "C" __EXPORT int uavcan_main(int argc, char *argv[]);
 
@@ -80,44 +163,58 @@ int uavcan_main(int argc, char *argv[])
 		printf("Usage: %s <node-id>\n", argv[0]);
 		return 1;
 	}
-	int self_node_id = atoi(argv[1]);
 
 	stm32_configgpio(GPIO_CAN1_RX);
 	stm32_configgpio(GPIO_CAN1_TX);
 	stm32_configgpio(GPIO_CAN2_RX | GPIO_PULLUP);
 	stm32_configgpio(GPIO_CAN2_TX);
 
-	static CanInitHelper can;
-	static bool can_initialized = false;
-
 	int32_t bitrate = 0;
 	(void)param_get(param_find("UAVCAN_BITRATE"), &bitrate);
-	if (!can_initialized) {
-		const int can_init_res = can.init(bitrate);
+	int can_init_res = can.init(bitrate);
 
-		if (can_init_res < 0) {
-			warnx("CAN driver init failed %i", can_init_res);
-			return can_init_res;
-		}
-
-		can_initialized = true;
+	if (can_init_res < 0) {
+		warnx("CAN driver init failed");
+		return can_init_res;	
 	}
 
 	Node *node = new Node(can.driver, uavcan_stm32::SystemClock::instance());
-	node->setNodeID(self_node_id);
-	node->setName("org.uavcan.tutorials");
+	node->setNodeID(atoi(argv[1]));
+	node->setName("uavcan");
+
 
 	while (true)
 	{
 		const int res = node->start();
 		if (res < 0)
 		{
-			printf("Node start failed: %d, will retry\n", res);
+			printf("Node start failed: %d, retry\n", res);
 			sleep(1);
 		}
 		else { break; }
 	}
 
-	printf("Hello Sky!\n");
-	return OK;
+	MsgController *_msg_controller = new MsgController(*node);
+	_msg_controller->init();
+
+	int i = 0;
+    node->setStatusOk();
+    while (true)
+    {
+        int res = node->spin(uavcan::MonotonicDuration::fromMSec(1000));
+        if (res < 0)
+        {
+            printf("Transient failure: %d\n", res);
+		}
+
+		uavcan::protocol::debug::KeyValue kv_msg;  // Always zero initialized
+		kv_msg.numeric_value.push_back(i);
+
+		kv_msg.key = "random";  // "random"
+		kv_msg.key += "_";      // "random_"
+		kv_msg.key += "int";  // "random_float"
+
+		_msg_controller->msg_broadcast(kv_msg);
+		i++;
+	}
 }
